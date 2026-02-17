@@ -86,15 +86,42 @@ def validate_repo_id(repo_id):
     Returns:
         True if valid, False otherwise
     """
-    # Pattern: alphanumeric, dash, underscore, optional slash
-    pattern = r'^[\w-]+(/[\w-]+)?$'
-    
-    if not re.match(pattern, repo_id):
+    # Hugging Face style:
+    # - repo_name or namespace/repo_name
+    # - allowed chars: letters, numbers, '-', '_', '.'
+    # - cannot start/end with '-' or '.'
+    # - no consecutive '--' or '..'
+    # - total length up to 96 chars
+    if not repo_id or len(repo_id) > 96:
+        err("❌ Invalid repository ID format.")
+        print("   Repo ID length must be 1..96 characters")
+        return False
+
+    if repo_id.count("/") > 1:
         err("❌ Invalid repository ID format.")
         print("   Format: username/reponame or just reponame")
-        print("   Allowed: letters, numbers, dash (-), underscore (_)")
         return False
-    
+
+    parts = repo_id.split("/")
+    segment_pattern = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*[A-Za-z0-9]$|^[A-Za-z0-9]$')
+
+    for part in parts:
+        if not part:
+            err("❌ Invalid repository ID format.")
+            print("   Empty namespace or repository name")
+            return False
+
+        if not segment_pattern.match(part):
+            err("❌ Invalid repository ID format.")
+            print("   Allowed: letters, numbers, dash (-), underscore (_), dot (.)")
+            print("   Name cannot start/end with '-' or '.'")
+            return False
+
+        if "--" in part or ".." in part:
+            err("❌ Invalid repository ID format.")
+            print("   '--' and '..' are not allowed")
+            return False
+
     return True
 
 
@@ -223,6 +250,121 @@ def download_file_with_progress(repo_id, filename, target_dir, token=None):
             err_msg = mask_sensitive_data(err_msg, token)
         err(f"Download failed: {err_msg}")
         return False
+
+
+def resolve_lora_target_dir(base_dir=None):
+    """
+    Resolve the best local directory for LoRA downloads.
+
+    Priority:
+    1) Existing directories that look like models/.../lora(s) or similar
+    2) Existing models directory -> create models/loras
+    3) Fallback create ./models/loras
+
+    Args:
+        base_dir: Starting directory for upward search
+
+    Returns:
+        tuple(path, status) where status in:
+        - found_existing
+        - created_in_models
+        - created_fallback
+        - error
+    """
+    base_dir = os.path.abspath(base_dir or os.getcwd())
+
+    # Optional explicit override
+    override_dir = os.getenv("LORA_TARGET_DIR") or os.getenv("LORAS_DIR")
+    if override_dir:
+        target = os.path.abspath(os.path.expanduser(override_dir))
+        try:
+            os.makedirs(target, exist_ok=True)
+            return target, "found_existing"
+        except Exception:
+            return target, "error"
+
+    ignore_dirs = {".git", "node_modules", "venv", ".venv", "__pycache__"}
+
+    def is_lora_like(name):
+        low = name.lower()
+        return ("lora" in low) or ("lycoris" in low)
+
+    def score_path(path):
+        low = path.lower().replace("\\", "/")
+        parts = [p for p in low.split("/") if p]
+        leaf = parts[-1] if parts else ""
+        score = 0
+        if leaf in ("loras", "lora", "lycoris"):
+            score += 100
+        elif is_lora_like(leaf):
+            score += 70
+        if "models" in parts:
+            score += 40
+        if len(parts) >= 2 and parts[-2] == "models":
+            score += 30
+        return score
+
+    # Build search roots: current dir + parents (up to 6 levels)
+    roots = []
+    cur = base_dir
+    for _ in range(7):
+        if cur not in roots:
+            roots.append(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+
+    # Include common Linux workspace path if present
+    if os.path.isdir("/workspace") and "/workspace" not in roots:
+        roots.append("/workspace")
+
+    lora_candidates = []
+    models_dirs = []
+
+    # Search limited depth to keep it fast
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        root_depth = root.rstrip("/\\").count(os.sep)
+        for walk_root, dirnames, _ in os.walk(root):
+            depth = walk_root.rstrip("/\\").count(os.sep) - root_depth
+            if depth > 4:
+                dirnames[:] = []
+                continue
+
+            dirnames[:] = [d for d in dirnames if d not in ignore_dirs and not d.startswith(".")]
+
+            for d in dirnames:
+                full_path = os.path.join(walk_root, d)
+                d_low = d.lower()
+                if d_low == "models":
+                    models_dirs.append(full_path)
+                if is_lora_like(d_low):
+                    lora_candidates.append(full_path)
+
+    # 1) Existing lora-like directory (prefer models/.../loras)
+    if lora_candidates:
+        best = sorted(set(lora_candidates), key=lambda p: (score_path(p), -len(p)), reverse=True)[0]
+        return best, "found_existing"
+
+    # 2) Existing models dir -> create models/loras
+    if models_dirs:
+        best_models = sorted(set(models_dirs), key=lambda p: (-(p.count(os.sep)), len(p)))[0]
+        target = os.path.join(best_models, "loras")
+        try:
+            os.makedirs(target, exist_ok=True)
+            return target, "created_in_models"
+        except Exception:
+            pass
+
+    # 3) Fallback: ./models/loras
+    fallback = os.path.join(base_dir, "models", "loras")
+    try:
+        os.makedirs(fallback, exist_ok=True)
+        return fallback, "created_fallback"
+    except Exception:
+        return fallback, "error"
 
 
 # ============================================================================
@@ -1377,69 +1519,15 @@ if __name__ == "__main__":
                 sys.exit(1)
             selected_file = choices[choice_num - 1]
             ok(t("file_label", file=selected_file))
-            # Determine local directory to save file
-            target_dir = ""
-            # Search for existing 'loras' directories under /workspace (depth 2)
-            found_dirs = []
-            base_path = "/workspace"
-            if os.path.isdir(base_path):
-                try:
-                    level1 = os.listdir(base_path)
-                except Exception:
-                    level1 = []
-                for d1 in level1:
-                    p1 = os.path.join(base_path, d1)
-                    if os.path.isdir(p1) and "loras" in d1.lower():
-                        found_dirs.append(p1)
-                    if os.path.isdir(p1):
-                        # search one more level
-                        try:
-                            level2 = os.listdir(p1)
-                        except Exception:
-                            level2 = []
-                        for d2 in level2:
-                            p2 = os.path.join(p1, d2)
-                            if os.path.isdir(p2) and "loras" in d2.lower():
-                                found_dirs.append(p2)
-            found_dirs = sorted(set(found_dirs))
-            if not found_dirs:
-                target_dir = "/workspace/loras"
-                try:
-                    os.makedirs(target_dir, exist_ok=True)
-                except Exception:
-                    target_dir = "./loras"
-                    try:
-                        os.makedirs(target_dir, exist_ok=True)
-                    except Exception:
-                        err(t("cannot_create_dir", dir=target_dir))
-                        sys.exit(1)
-                    warn(t("using_local_loras"))
-                else:
-                    ok(t("created_dir", dir=target_dir))
-            elif len(found_dirs) == 1:
-                target_dir = found_dirs[0]
+            # Determine local directory to save file (models/.../lora parser)
+            target_dir, target_status = resolve_lora_target_dir(os.getcwd())
+            if target_status == "error":
+                err(t("cannot_create_dir", dir=target_dir))
+                sys.exit(1)
+            if target_status == "found_existing":
                 ok(t("using_dir", dir=target_dir))
             else:
-                say(t("target_dir_multi"))
-                for idx, d in enumerate(found_dirs, start=1):
-                    print(f"  [{idx}] {d}")
-                print()
-                dir_choice = input(t("select_directory", total=len(found_dirs))).strip() or "1"
-                if not dir_choice.isdigit():
-                    dir_choice = "1"
-                dir_idx = int(dir_choice)
-                if dir_idx < 1 or dir_idx > len(found_dirs):
-                    warn(t("invalid_choice"))
-                    dir_idx = 1
-                target_dir = found_dirs[dir_idx - 1]
-                ok(t("using_dir", dir=target_dir))
-            # Ensure target_dir exists (already handled above)
-            if not os.path.isdir(target_dir):
-                try:
-                    os.makedirs(target_dir, exist_ok=True)
-                except Exception:
-                    err(t("cannot_create_dir", dir=target_dir))
-                    sys.exit(1)
+                ok(t("created_dir", dir=target_dir))
             # Download the selected file
             if not download_file_with_progress(selected_repo, selected_file, target_dir, token):
                 sys.exit(1)
@@ -1513,66 +1601,15 @@ if __name__ == "__main__":
             if not files_to_download:
                 err(t("no_files_range"))
                 sys.exit(1)
-            # Determine local directory to save files (same logic as above)
-            target_dir = ""
-            found_dirs = []
-            base_path = "/workspace"
-            if os.path.isdir(base_path):
-                try:
-                    level1 = os.listdir(base_path)
-                except Exception:
-                    level1 = []
-                for d1 in level1:
-                    p1 = os.path.join(base_path, d1)
-                    if os.path.isdir(p1) and "loras" in d1.lower():
-                        found_dirs.append(p1)
-                    if os.path.isdir(p1):
-                        try:
-                            level2 = os.listdir(p1)
-                        except Exception:
-                            level2 = []
-                        for d2 in level2:
-                            p2 = os.path.join(p1, d2)
-                            if os.path.isdir(p2) and "loras" in d2.lower():
-                                found_dirs.append(p2)
-            found_dirs = sorted(set(found_dirs))
-            if not found_dirs:
-                target_dir = "/workspace/loras"
-                try:
-                    os.makedirs(target_dir, exist_ok=True)
-                except Exception:
-                    target_dir = "./loras"
-                    try:
-                        os.makedirs(target_dir, exist_ok=True)
-                    except Exception:
-                        err(t("cannot_create_dir", dir=target_dir))
-                        sys.exit(1)
-                    warn(t("using_local_loras"))
-                else:
-                    ok(t("created_dir", dir=target_dir))
-            elif len(found_dirs) == 1:
-                target_dir = found_dirs[0]
+            # Determine local directory to save files (models/.../lora parser)
+            target_dir, target_status = resolve_lora_target_dir(os.getcwd())
+            if target_status == "error":
+                err(t("cannot_create_dir", dir=target_dir))
+                sys.exit(1)
+            if target_status == "found_existing":
                 ok(t("using_dir", dir=target_dir))
             else:
-                say(t("target_dir_multi"))
-                for idx, d in enumerate(found_dirs, start=1):
-                    print(f"  [{idx}] {d}")
-                print()
-                dir_choice = input(t("select_directory", total=len(found_dirs))).strip() or "1"
-                if not dir_choice.isdigit():
-                    dir_choice = "1"
-                dir_idx = int(dir_choice)
-                if dir_idx < 1 or dir_idx > len(found_dirs):
-                    warn(t("invalid_choice"))
-                    dir_idx = 1
-                target_dir = found_dirs[dir_idx - 1]
-                ok(t("using_dir", dir=target_dir))
-            if not os.path.isdir(target_dir):
-                try:
-                    os.makedirs(target_dir, exist_ok=True)
-                except Exception:
-                    err(t("cannot_create_dir", dir=target_dir))
-                    sys.exit(1)
+                ok(t("created_dir", dir=target_dir))
             # Download files in the list
             from huggingface_hub import hf_hub_download
             success_count = 0
